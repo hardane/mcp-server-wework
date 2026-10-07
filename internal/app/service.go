@@ -19,10 +19,12 @@ import (
 )
 
 type Service struct {
-	mu       sync.Mutex
-	username string
-	password string
-	client   *wework.WeWork
+	mu            sync.Mutex
+	username      string
+	password      string
+	client        *wework.WeWork
+	reauthing     bool
+	reauthWaiters []chan struct{}
 }
 
 func NewService() *Service {
@@ -37,11 +39,20 @@ func (s *Service) clientForRequest() (*wework.WeWork, error) {
 		return s.client, nil
 	}
 
+	return s.createAuthenticatedClientLocked()
+}
+
+// createAuthenticatedClientLocked creates a new authenticated WeWork client.
+// The caller must hold s.mu.
+func (s *Service) createAuthenticatedClientLocked() (*wework.WeWork, error) {
 	username := strings.TrimSpace(firstNonEmpty(s.username, os.Getenv("WEWORK_USERNAME")))
 	password := strings.TrimSpace(firstNonEmpty(s.password, os.Getenv("WEWORK_PASSWORD")))
 	if username == "" || password == "" {
 		return nil, fmt.Errorf("WEWORK_USERNAME and WEWORK_PASSWORD must be set in the environment")
 	}
+
+	s.username = username
+	s.password = password
 
 	auth, err := wework.NewWeWorkAuth(username, password)
 	if err != nil {
@@ -50,11 +61,92 @@ func (s *Service) clientForRequest() (*wework.WeWork, error) {
 
 	login, _, err := auth.Authenticate()
 	if err != nil {
-		return nil, fmt.Errorf("authentication failed: %w", err)
+		return nil, fmt.Errorf("WeWork login failed: %w", err)
 	}
 
 	s.client = wework.NewWeWork(login.A0token)
 	return s.client, nil
+}
+
+// reauthenticate invalidates the current client and creates a new authenticated one.
+// It ensures only one goroutine performs re-authentication while others wait.
+func (s *Service) reauthenticate() error {
+	s.mu.Lock()
+
+	// If another goroutine is already re-authenticating, wait for it
+	if s.reauthing {
+		waiter := make(chan struct{})
+		s.reauthWaiters = append(s.reauthWaiters, waiter)
+		s.mu.Unlock()
+		<-waiter
+		return nil
+	}
+
+	// Mark that we're re-authenticating
+	s.reauthing = true
+	s.mu.Unlock()
+
+	// Perform re-authentication outside the lock
+	defer func() {
+		s.mu.Lock()
+		s.reauthing = false
+		// Wake up all waiters
+		for _, ch := range s.reauthWaiters {
+			close(ch)
+		}
+		s.reauthWaiters = nil
+		s.mu.Unlock()
+	}()
+
+	s.mu.Lock()
+	s.client = nil
+	_, err := s.createAuthenticatedClientLocked()
+	s.mu.Unlock()
+
+	return err
+}
+
+// executeWithRetry executes a function that may fail with a 401, automatically
+// re-authenticating once if needed.
+func (s *Service) executeWithRetry(fn func(*wework.WeWork) error) error {
+	client, err := s.clientForRequest()
+	if err != nil {
+		return err
+	}
+
+	err = fn(client)
+	if err == nil {
+		return nil
+	}
+
+	// Check if it's a 401 error
+	if !is401Error(err) {
+		return err
+	}
+
+	// Attempt to re-authenticate
+	if err := s.reauthenticate(); err != nil {
+		return fmt.Errorf("re-authentication failed: %w", err)
+	}
+
+	// Retry once with the new client
+	client, err = s.clientForRequest()
+	if err != nil {
+		return err
+	}
+
+	return fn(client)
+}
+
+// is401Error checks if an error message indicates a 401 Unauthorized response
+func is401Error(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "status code: 401") ||
+		strings.Contains(msg, "401 Unauthorized") ||
+		strings.Contains(msg, "Unauthorized")
 }
 
 func firstNonEmpty(values ...string) string {
@@ -252,24 +344,22 @@ func (s *Service) Locations(ctx context.Context, input LocationsInput) (Location
 	if strings.TrimSpace(input.City) == "" {
 		return LocationsResult{}, fmt.Errorf("city is required")
 	}
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return LocationsResult{}, err
-	}
-	res, err := ww.GetLocationsByGeo(input.City)
-	if err != nil {
-		return LocationsResult{}, err
-	}
-	return LocationsResult{Items: res.LocationsByGeo}, nil
+	
+	var result LocationsResult
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		res, err := ww.GetLocationsByGeo(input.City)
+		if err != nil {
+			return err
+		}
+		result = LocationsResult{Items: res.LocationsByGeo}
+		return nil
+	})
+	return result, err
 }
 
 func (s *Service) Desks(ctx context.Context, input DesksInput) (DesksResult, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return DesksResult{}, err
-	}
-
+	
 	if strings.TrimSpace(input.LocationUUID) == "" && strings.TrimSpace(input.City) == "" {
 		return DesksResult{}, fmt.Errorf("location_uuid or city is required")
 	}
@@ -279,71 +369,79 @@ func (s *Service) Desks(ctx context.Context, input DesksInput) (DesksResult, err
 		date = time.Now().Format("2006-01-02")
 	}
 
-	locationUUIDs, _, err := resolveLocationUUIDsForDesks(ww, input.LocationUUID, input.City)
-	if err != nil {
-		return DesksResult{}, err
-	}
-
 	dateParsed, err := tzdate.ParseInTimezone("2006-01-02", date, "Local")
 	if err != nil {
 		return DesksResult{}, err
 	}
 
-	resp, err := ww.GetAvailableSpaces(dateParsed, locationUUIDs)
+	var rows []AvailableSpace
+	err = s.executeWithRetry(func(ww *wework.WeWork) error {
+		locationUUIDs, _, err := resolveLocationUUIDsForDesks(ww, input.LocationUUID, input.City)
+		if err != nil {
+			return err
+		}
+
+		resp, err := ww.GetAvailableSpaces(dateParsed, locationUUIDs)
+		if err != nil {
+			return err
+		}
+
+		rows = make([]AvailableSpace, 0, len(resp.Response.Workspaces))
+		for _, space := range resp.Response.Workspaces {
+			rows = append(rows, AvailableSpace{
+				Location:        space.Location.Name,
+				ReservableID:    space.UUID,
+				LocationID:      space.Location.UUID,
+				Available:       space.Seat.Available,
+				ReservableType:  reservableTypeName(space),
+				ReservableName:  reservableName(space),
+				ReservableFloor: reservableFloorName(space),
+			})
+		}
+		return nil
+	})
+
 	if err != nil {
 		return DesksResult{}, err
 	}
-
-	rows := make([]AvailableSpace, 0, len(resp.Response.Workspaces))
-	for _, space := range resp.Response.Workspaces {
-		rows = append(rows, AvailableSpace{
-			Location:        space.Location.Name,
-			ReservableID:    space.UUID,
-			LocationID:      space.Location.UUID,
-			Available:       space.Seat.Available,
-			ReservableType:  reservableTypeName(space),
-			ReservableName:  reservableName(space),
-			ReservableFloor: reservableFloorName(space),
-		})
-	}
-
 	return DesksResult{Items: rows}, nil
 }
 
 func (s *Service) Bookings(ctx context.Context, input BookingsInput) (BookingsResult, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return BookingsResult{}, err
-	}
-
+	
 	var bookings []*wework.Booking
-	if input.Past {
-		if input.StartDate != "" || input.EndDate != "" {
-			var start, end time.Time
-			if input.StartDate != "" {
-				start, err = time.Parse("2006-01-02", input.StartDate)
-				if err != nil {
-					return BookingsResult{}, fmt.Errorf("invalid start_date: %w", err)
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		var err error
+		if input.Past {
+			if input.StartDate != "" || input.EndDate != "" {
+				var start, end time.Time
+				if input.StartDate != "" {
+					start, err = time.Parse("2006-01-02", input.StartDate)
+					if err != nil {
+						return fmt.Errorf("invalid start_date: %w", err)
+					}
+				} else {
+					start = time.Now().AddDate(0, 0, -30)
 				}
-			} else {
-				start = time.Now().AddDate(0, 0, -30)
-			}
-			if input.EndDate != "" {
-				end, err = time.Parse("2006-01-02", input.EndDate)
-				if err != nil {
-					return BookingsResult{}, fmt.Errorf("invalid end_date: %w", err)
+				if input.EndDate != "" {
+					end, err = time.Parse("2006-01-02", input.EndDate)
+					if err != nil {
+						return fmt.Errorf("invalid end_date: %w", err)
+					}
+				} else {
+					end = time.Now()
 				}
+				bookings, err = ww.GetPastBookingsWithDates(start, end)
 			} else {
-				end = time.Now()
+				bookings, err = ww.GetPastBookings()
 			}
-			bookings, err = ww.GetPastBookingsWithDates(start, end)
 		} else {
-			bookings, err = ww.GetPastBookings()
+			bookings, err = ww.GetUpcomingBookings()
 		}
-	} else {
-		bookings, err = ww.GetUpcomingBookings()
-	}
+		return err
+	})
+	
 	if err != nil {
 		return BookingsResult{}, err
 	}
@@ -357,179 +455,194 @@ func (s *Service) Bookings(ctx context.Context, input BookingsInput) (BookingsRe
 
 func (s *Service) Book(ctx context.Context, input BookInput) (BookResults, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return BookResults{}, err
-	}
-
-	targetLocationUUID, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
-	if err != nil {
-		return BookResults{}, err
-	}
-
+	
 	dates, err := parseDateSelection(input.Date)
 	if err != nil {
 		return BookResults{}, err
 	}
 
-	results := make([]BookResult, 0, len(dates))
-	for _, bookingDate := range dates {
-		row := BookResult{Date: bookingDate.Format("2006-01-02")}
-
-		spaces, err := ww.GetAvailableSpaces(bookingDate, []string{targetLocationUUID})
+	var results []BookResult
+	err = s.executeWithRetry(func(ww *wework.WeWork) error {
+		targetLocationUUID, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
 		if err != nil {
-			row.Error = fmt.Sprintf("error getting spaces: %v", err)
-			results = append(results, row)
-			continue
-		}
-		if len(spaces.Response.Workspaces) == 0 {
-			row.Error = "no spaces found"
-			results = append(results, row)
-			continue
-		}
-		if len(spaces.Response.Workspaces) > 1 {
-			row.Error = "multiple spaces found, please specify a more specific location"
-			results = append(results, row)
-			continue
+			return err
 		}
 
-		space := spaces.Response.Workspaces[0]
-		row.SpaceUUID = space.UUID
-		row.LocationUUID = space.Location.UUID
-		row.LocationName = space.Location.Name
+		results = make([]BookResult, 0, len(dates))
+		for _, bookingDate := range dates {
+			row := BookResult{Date: bookingDate.Format("2006-01-02")}
 
-		bookRes, err := ww.PostBooking(bookingDate, &space)
-		if err != nil {
-			row.Error = fmt.Sprintf("booking failed: %v", err)
-		} else {
-			row.BookingStatus = bookRes
+			spaces, err := ww.GetAvailableSpaces(bookingDate, []string{targetLocationUUID})
+			if err != nil {
+				row.Error = fmt.Sprintf("error getting spaces: %v", err)
+				results = append(results, row)
+				continue
+			}
+			if len(spaces.Response.Workspaces) == 0 {
+				row.Error = "no spaces found"
+				results = append(results, row)
+				continue
+			}
+			if len(spaces.Response.Workspaces) > 1 {
+				row.Error = "multiple spaces found, please specify a more specific location"
+				results = append(results, row)
+				continue
+			}
+
+			space := spaces.Response.Workspaces[0]
+			row.SpaceUUID = space.UUID
+			row.LocationUUID = space.Location.UUID
+			row.LocationName = space.Location.Name
+
+			bookRes, err := ww.PostBooking(bookingDate, &space)
+			if err != nil {
+				row.Error = fmt.Sprintf("booking failed: %v", err)
+			} else {
+				row.BookingStatus = bookRes
+			}
+			results = append(results, row)
 		}
-		results = append(results, row)
+		return nil
+	})
+
+	if err != nil {
+		return BookResults{}, err
 	}
-
 	return BookResults{Items: results}, nil
 }
 
 func (s *Service) Quote(ctx context.Context, input QuoteInput) (QuoteResults, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return QuoteResults{}, err
-	}
-
-	targetLocationUUID, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
-	if err != nil {
-		return QuoteResults{}, err
-	}
-
+	
 	dates, err := parseDateSelection(input.Date)
 	if err != nil {
 		return QuoteResults{}, err
 	}
 
-	results := make([]QuoteResult, 0, len(dates))
-	for _, bookingDate := range dates {
-		row := QuoteResult{Date: bookingDate.Format("2006-01-02")}
-
-		spaces, err := ww.GetAvailableSpaces(bookingDate, []string{targetLocationUUID})
+	var results []QuoteResult
+	err = s.executeWithRetry(func(ww *wework.WeWork) error {
+		targetLocationUUID, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
 		if err != nil {
-			row.Error = fmt.Sprintf("error getting spaces: %v", err)
-			results = append(results, row)
-			continue
-		}
-		if len(spaces.Response.Workspaces) == 0 {
-			row.Error = "no spaces found"
-			results = append(results, row)
-			continue
-		}
-		if len(spaces.Response.Workspaces) > 1 {
-			row.Error = "multiple spaces found, please specify a more specific location"
-			results = append(results, row)
-			continue
+			return err
 		}
 
-		space := spaces.Response.Workspaces[0]
-		row.SpaceUUID = space.UUID
-		row.LocationUUID = space.Location.UUID
-		row.LocationName = space.Location.Name
+		results = make([]QuoteResult, 0, len(dates))
+		for _, bookingDate := range dates {
+			row := QuoteResult{Date: bookingDate.Format("2006-01-02")}
 
-		quote, err := ww.GetBookingQuote(bookingDate, &space)
-		if err != nil {
-			row.Error = fmt.Sprintf("failed to get booking quote: %v", err)
-		} else {
-			row.Quote = quote
+			spaces, err := ww.GetAvailableSpaces(bookingDate, []string{targetLocationUUID})
+			if err != nil {
+				row.Error = fmt.Sprintf("error getting spaces: %v", err)
+				results = append(results, row)
+				continue
+			}
+			if len(spaces.Response.Workspaces) == 0 {
+				row.Error = "no spaces found"
+				results = append(results, row)
+				continue
+			}
+			if len(spaces.Response.Workspaces) > 1 {
+				row.Error = "multiple spaces found, please specify a more specific location"
+				results = append(results, row)
+				continue
+			}
+
+			space := spaces.Response.Workspaces[0]
+			row.SpaceUUID = space.UUID
+			row.LocationUUID = space.Location.UUID
+			row.LocationName = space.Location.Name
+
+			quote, err := ww.GetBookingQuote(bookingDate, &space)
+			if err != nil {
+				row.Error = fmt.Sprintf("failed to get booking quote: %v", err)
+			} else {
+				row.Quote = quote
+			}
+			results = append(results, row)
 		}
-		results = append(results, row)
+		return nil
+	})
+
+	if err != nil {
+		return QuoteResults{}, err
 	}
-
 	return QuoteResults{Items: results}, nil
 }
 
 func (s *Service) Info(ctx context.Context, input InfoInput) (*wework.LocationFeaturesResponse, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
-
-	locationUUID := input.LocationUUID
-	if locationUUID == "" {
-		locationUUID, err = resolveLocationUUID(ww, input.City, input.Name, "")
-		if err != nil {
-			return nil, err
+	
+	var result *wework.LocationFeaturesResponse
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		locationUUID := input.LocationUUID
+		if locationUUID == "" {
+			var err error
+			locationUUID, err = resolveLocationUUID(ww, input.City, input.Name, "")
+			if err != nil {
+				return err
+			}
 		}
-	}
 
-	return ww.GetLocationFeatures(locationUUID, input.AmenitiesOnly)
+		var err error
+		result, err = ww.GetLocationFeatures(locationUUID, input.AmenitiesOnly)
+		return err
+	})
+	return result, err
 }
 
 func (s *Service) Me(ctx context.Context, input MeInput) (any, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
+	
+	var result any
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		profile, err := ww.GetUserProfile()
+		if err != nil {
+			return err
+		}
+		if !input.IncludeBootstrap {
+			result = profile
+			return nil
+		}
 
-	profile, err := ww.GetUserProfile()
-	if err != nil {
-		return nil, err
-	}
-	if !input.IncludeBootstrap {
-		return profile, nil
-	}
+		bootstrap, err := ww.GetBootstrap()
+		if err != nil {
+			return err
+		}
 
-	bootstrap, err := ww.GetBootstrap()
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]any{
-		"userProfile": profile,
-		"bootstrap":   bootstrap,
-	}, nil
+		result = map[string]any{
+			"userProfile": profile,
+			"bootstrap":   bootstrap,
+		}
+		return nil
+	})
+	return result, err
 }
 
 func (s *Service) Calendar(ctx context.Context, input CalendarInput) (CalendarOutput, error) {
 	_ = ctx
 	_ = input
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return CalendarOutput{}, err
-	}
+	
+	var allBookings []*wework.Booking
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		pastBookings, err := ww.GetPastBookings()
+		if err != nil {
+			return err
+		}
+		upcomingBookings, err := ww.GetUpcomingBookings()
+		if err != nil {
+			return err
+		}
 
-	pastBookings, err := ww.GetPastBookings()
+		if len(pastBookings) > 10 {
+			pastBookings = pastBookings[:10]
+		}
+		allBookings = append(pastBookings, upcomingBookings...)
+		return nil
+	})
+	
 	if err != nil {
 		return CalendarOutput{}, err
 	}
-	upcomingBookings, err := ww.GetUpcomingBookings()
-	if err != nil {
-		return CalendarOutput{}, err
-	}
-
-	if len(pastBookings) > 10 {
-		pastBookings = pastBookings[:10]
-	}
-	allBookings := append(pastBookings, upcomingBookings...)
 
 	cal := ics.NewCalendar()
 	cal.SetProductId("-//WeWork Calendar//mcp-server-wework//")
@@ -584,55 +697,59 @@ func (s *Service) CancelBooking(ctx context.Context, input CancelBookingInput) (
 		return nil, fmt.Errorf("booking_uuid is required")
 	}
 
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
+	var result any
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		request, err := ww.BuildCancelBookingRequest(input.BookingUUID)
+		if err != nil {
+			return err
+		}
 
-	request, err := ww.BuildCancelBookingRequest(input.BookingUUID)
-	if err != nil {
-		return nil, err
-	}
+		response, err := ww.CancelBooking(input.BookingUUID)
+		if err != nil {
+			return err
+		}
 
-	response, err := ww.CancelBooking(input.BookingUUID)
-	if err != nil {
-		return nil, err
-	}
-
-	return CancelBookingOutput{
-		BookingUUID: input.BookingUUID,
-		Request:     request,
-		Response:    response,
-	}, nil
+		result = CancelBookingOutput{
+			BookingUUID: input.BookingUUID,
+			Request:     request,
+			Response:    response,
+		}
+		return nil
+	})
+	return result, err
 }
 
 // Favorites lists the member's favorite (and recent) locations for a space type.
 // space_type must be 0-3; the WeWork API rejects other values.
 func (s *Service) Favorites(ctx context.Context, input FavoritesInput) (FavoritesResult, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return FavoritesResult{}, err
-	}
-	resp, err := ww.GetFavoriteLocations(input.SpaceType)
-	if err != nil {
-		return FavoritesResult{}, err
-	}
-	return FavoritesResult{Items: resp.FavoriteLocations, Recents: resp.RecentLocations}, nil
+	
+	var result FavoritesResult
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		resp, err := ww.GetFavoriteLocations(input.SpaceType)
+		if err != nil {
+			return err
+		}
+		result = FavoritesResult{Items: resp.FavoriteLocations, Recents: resp.RecentLocations}
+		return nil
+	})
+	return result, err
 }
 
 // AddFavorite favorites a location, identified by UUID or by city + name.
 func (s *Service) AddFavorite(ctx context.Context, input AddFavoriteInput) (any, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
-	uuid, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
-	if err != nil {
-		return nil, err
-	}
-	return ww.MarkFavoriteLocation(favoriteRequest(uuid, input.SpaceType, false, 0))
+	
+	var result any
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		uuid, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
+		if err != nil {
+			return err
+		}
+		result, err = ww.MarkFavoriteLocation(favoriteRequest(uuid, input.SpaceType, false, 0))
+		return err
+	})
+	return result, err
 }
 
 // RemoveFavorite removes a location from the member's favorites. The API deletes
@@ -641,48 +758,51 @@ func (s *Service) AddFavorite(ctx context.Context, input AddFavoriteInput) (any,
 // favorites across every space type to find the id(s) to delete.
 func (s *Service) RemoveFavorite(ctx context.Context, input RemoveFavoriteInput) (any, error) {
 	_ = ctx
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
-
-	if input.Hmy > 0 {
-		return ww.MarkFavoriteLocation(favoriteRequest("", 0, true, input.Hmy))
-	}
-
-	uuid, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
-	if err != nil {
-		return nil, err
-	}
-
-	type match struct {
-		id        int
-		spaceType int
-	}
-	var matches []match
-	for st := 0; st <= favoriteMaxSpaceType; st++ {
-		favs, err := ww.GetFavoriteLocations(st)
-		if err != nil {
-			return nil, fmt.Errorf("failed to look up favorites (space_type %d): %w", st, err)
+	
+	var result any
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		if input.Hmy > 0 {
+			var err error
+			result, err = ww.MarkFavoriteLocation(favoriteRequest("", 0, true, input.Hmy))
+			return err
 		}
-		for _, f := range favs.FavoriteLocations {
-			if f.LocationID == uuid && f.Hmy > 0 {
-				matches = append(matches, match{id: f.Hmy, spaceType: st})
+
+		uuid, err := resolveLocationUUID(ww, input.City, input.Name, input.LocationUUID)
+		if err != nil {
+			return err
+		}
+
+		type match struct {
+			id        int
+			spaceType int
+		}
+		var matches []match
+		for st := 0; st <= favoriteMaxSpaceType; st++ {
+			favs, err := ww.GetFavoriteLocations(st)
+			if err != nil {
+				return fmt.Errorf("failed to look up favorites (space_type %d): %w", st, err)
+			}
+			for _, f := range favs.FavoriteLocations {
+				if f.LocationID == uuid && f.Hmy > 0 {
+					matches = append(matches, match{id: f.Hmy, spaceType: st})
+				}
 			}
 		}
-	}
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("location %s is not in your favorites", uuid)
-	}
-
-	var last map[string]any
-	for _, m := range matches {
-		last, err = ww.MarkFavoriteLocation(favoriteRequest("", m.spaceType, true, m.id))
-		if err != nil {
-			return nil, fmt.Errorf("failed to remove favorite (id %d): %w", m.id, err)
+		if len(matches) == 0 {
+			return fmt.Errorf("location %s is not in your favorites", uuid)
 		}
-	}
-	return last, nil
+
+		var last map[string]any
+		for _, m := range matches {
+			last, err = ww.MarkFavoriteLocation(favoriteRequest("", m.spaceType, true, m.id))
+			if err != nil {
+				return fmt.Errorf("failed to remove favorite (id %d): %w", m.id, err)
+			}
+		}
+		result = last
+		return nil
+	})
+	return result, err
 }
 
 // favoriteRequest builds the mark-as-favorite payload with the app's default
@@ -702,11 +822,13 @@ func favoriteRequest(locationUUID string, spaceType int, remove bool, id int) we
 
 // PrintQueue returns the member's current print queue.
 func (s *Service) PrintQueue(ctx context.Context, input PrintQueueInput) (*wework.PrintQueueResponse, error) {
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
-	return ww.GetPrintQueue(ctx, input.JobIDs)
+	var result *wework.PrintQueueResponse
+	err := s.executeWithRetry(func(ww *wework.WeWork) error {
+		var err error
+		result, err = ww.GetPrintQueue(ctx, input.JobIDs)
+		return err
+	})
+	return result, err
 }
 
 // AddPrintJob uploads a base64-encoded document to the member's print queue.
@@ -721,21 +843,24 @@ func (s *Service) AddPrintJob(ctx context.Context, input AddPrintJobInput) (*wew
 	if len(fileBytes) == 0 {
 		return nil, fmt.Errorf("file_base64 is required")
 	}
-	ww, err := s.clientForRequest()
-	if err != nil {
-		return nil, err
-	}
-	return ww.AddToPrintQueue(ctx, wework.AddPrintJobRequest{
-		Copies:               input.Copies,
-		ForceMediaSize:       input.ForceMediaSize,
-		OrientationRequested: input.Orientation,
-		PrintColorMode:       input.ColorMode,
-		Sides:                input.Sides,
-		JobName:              input.JobName,
-		FileName:             input.FileName,
-		FileContentType:      input.FileContentType,
-		FileBytes:            fileBytes,
+	
+	var result *wework.PrintJob
+	err = s.executeWithRetry(func(ww *wework.WeWork) error {
+		var err error
+		result, err = ww.AddToPrintQueue(ctx, wework.AddPrintJobRequest{
+			Copies:               input.Copies,
+			ForceMediaSize:       input.ForceMediaSize,
+			OrientationRequested: input.Orientation,
+			PrintColorMode:       input.ColorMode,
+			Sides:                input.Sides,
+			JobName:              input.JobName,
+			FileName:             input.FileName,
+			FileContentType:      input.FileContentType,
+			FileBytes:            fileBytes,
+		})
+		return err
 	})
+	return result, err
 }
 
 // decodeBase64Loose decodes base64 that may arrive with surrounding or internal
